@@ -1,14 +1,27 @@
 import os
 import json
+import re
+
+
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as gg
 import plotly.graph_objects as go
 import streamlit as st
 
+
 # Import prediction helpers from predict.py
-from predict import load_deployment_artifacts, prepare_flight_features, predict_single_flight
+from predict import load_deployment_artifacts, prepare_flight_features
+from src.rag_engine import ProjectRAGSystem
+from src.analytics import build_monthly_statistics
+
+
+CHAT_AVATAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "chat")
+CHAT_AVATARS = {
+    "assistant": os.path.join(CHAT_AVATAR_DIR, "ai-analyst-avatar.png"),
+    "user": os.path.join(CHAT_AVATAR_DIR, "user-avatar.png"),
+}
+
 
 # Set Streamlit Page Config
 st.set_page_config(
@@ -23,9 +36,482 @@ light_mode = st.sidebar.toggle("Light background", value=False)
 plotly_template = "plotly_white" if light_mode else "plotly_dark"
 chart_text_color = "#1f2937" if light_mode else "#e2e8f0"
 
+@st.cache_resource
+def get_cached_model_artifacts(model_type):
+    return load_deployment_artifacts(model_type=model_type)
+
+
+@st.cache_resource
+def get_cached_rag_engine(base_dir, engine_version):
+    return ProjectRAGSystem(base_dir)
+
+
+@st.cache_data(max_entries=256)
+def get_cached_prediction(flight_info, model_type):
+    pipeline, encoders = get_cached_model_artifacts(model_type)
+    prepared = prepare_flight_features(flight_info, encoders)
+    predicted_taxi_out = float(pipeline.predict(prepared)[0])
+    dep_time = flight_info.get("DEP_TIME", flight_info.get("CRS_DEP_TIME"))
+    total_minutes = (int(dep_time) // 100 * 60 + int(dep_time) % 100 + int(round(predicted_taxi_out))) % 1440
+    return {
+        "predicted_taxi_out_minutes": round(predicted_taxi_out, 1),
+        "estimated_wheels_off": f"{total_minutes // 60:02d}:{total_minutes % 60:02d}",
+        "scheduled_dep": f"{int(flight_info.get('CRS_DEP_TIME')) // 100:02d}:{int(flight_info.get('CRS_DEP_TIME')) % 100:02d}",
+        "actual_dep_time": f"{int(dep_time) // 100:02d}:{int(dep_time) % 100:02d}",
+    }
+
+
+@st.cache_data(max_entries=128)
+def get_cached_sensitivity_curve(flight_info, model_type):
+    pipeline, encoders = get_cached_model_artifacts(model_type)
+    temp_flight = flight_info.copy()
+    congestion_values = list(range(1, 36))
+    prepared_inputs = []
+    for congestion in congestion_values:
+        temp_flight["CONGESTION_1H"] = congestion
+        temp_flight["CONGESTION_30M"] = congestion // 2
+        prepared_inputs.append(prepare_flight_features(temp_flight, encoders))
+    combined_inputs = pd.concat(prepared_inputs, ignore_index=True)
+    predictions = pipeline.predict(combined_inputs).astype(float).tolist()
+    return pd.DataFrame({
+        "Pushbacks / Hour": congestion_values,
+        "Predicted Taxi-Out (min)": predictions,
+    })
+
+# AI Analyst Chat Dialog Definition
+def clean_ai_answer(content):
+    """Removes legacy file-path headings from displayed chat answers."""
+    return re.sub(
+        r"^\s*\*\*From `[^`]+` \([^\n]+?\):\*\*\s*",
+        "",
+        content,
+    ).strip()
+
+
+def refresh_ai_chat_topic():
+    """Keeps follow-up context aligned with the remaining chat history."""
+    latest_topic = next(
+        (
+            message.get("topic")
+            for message in reversed(st.session_state.get("dialog_chat_history", []))
+            if message.get("role") == "assistant" and message.get("topic")
+        ),
+        None,
+    )
+    if latest_topic:
+        st.session_state.ai_last_dashboard_topic = latest_topic
+    else:
+        st.session_state.pop("ai_last_dashboard_topic", None)
+
+
+def delete_ai_chat_exchange(assistant_index):
+    """Deletes one assistant response and its immediately preceding user question."""
+    history = st.session_state.get("dialog_chat_history", [])
+    if not 0 <= assistant_index < len(history):
+        return
+    start_index = assistant_index
+    if assistant_index > 0 and history[assistant_index - 1].get("role") == "user":
+        start_index = assistant_index - 1
+    del history[start_index:assistant_index + 1]
+    refresh_ai_chat_topic()
+
+
+def clear_ai_chat_history():
+    """Clears all displayed questions, answers, and their conversational context."""
+    st.session_state.dialog_chat_history = []
+    st.session_state.pop("ai_last_dashboard_topic", None)
+
+
+@st.fragment(key="ai_analyst_chat")
+def show_ai_analyst_dialog():
+    st.markdown(
+        '<div class="ai-chat-drag-handle">AI Analyst <span>Drag to move · resize at corner</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.caption("Ask about data, cleaning, features, models, metrics, predictions, congestion, routes, or project methods.")
+
+    rag_engine_version = "authoritative-knowledge-router-v18"
+    if st.session_state.get("rag_engine_version") != rag_engine_version:
+        with st.spinner("Loading AI Analyst results..."):
+            st.session_state.rag_engine = get_cached_rag_engine(
+                os.path.dirname(os.path.abspath(__file__)),
+                rag_engine_version,
+            )
+            st.session_state.rag_engine_version = rag_engine_version
+
+    if "dialog_chat_history" not in st.session_state:
+        st.session_state.dialog_chat_history = [
+            {"role": "assistant", "content": "Hello! I am your **AI Analyst**. What would you like to know about this project?"}
+        ]
+    if st.session_state.get("source_visibility_version") != 2:
+        for message in st.session_state.dialog_chat_history:
+            message["show_sources"] = False
+        st.session_state.source_visibility_version = 2
+
+    chat_box = st.container(height="stretch", key="ai_chat_messages")
+    with chat_box:
+        for message_index, msg in enumerate(st.session_state.dialog_chat_history):
+            with st.chat_message(msg["role"], avatar=CHAT_AVATARS.get(msg["role"])):
+                st.markdown(clean_ai_answer(msg["content"]))
+                if msg.get("show_sources") and msg.get("sources"):
+                    with st.expander("📚 Sources", expanded=False):
+                        for s in msg["sources"]:
+                            st.caption(f"- {s}")
+                if (
+                    msg.get("role") == "assistant"
+                    and message_index > 0
+                    and st.session_state.dialog_chat_history[message_index - 1].get("role") == "user"
+                ):
+                    st.button(
+                        "Delete Q&A",
+                        key=f"ai_chat_delete_pair_{message_index}",
+                        on_click=delete_ai_chat_exchange,
+                        args=(message_index,),
+                    )
+
+    st.iframe(
+        """
+        <button id="speech-read">Read latest response</button>
+        <button id="clear-all">Clear all</button>
+        <style>
+            html, body {
+                display: flex; gap: 6px; margin: 0; padding: 0;
+                background: transparent;
+            }
+            button {
+                border: 1px solid #38bdf8; border-radius: 10px; padding: 3px 8px;
+                background: #172033; color: #e5e7eb; font: 11px/1.15 "Segoe UI", sans-serif;
+                cursor: pointer;
+            }
+            #clear-all {
+                border-color: #f97316;
+                background: #7c2d12;
+            }
+        </style>
+        <script>
+            class AIChatController {
+                constructor(frameWindow, parentWindow, readButton, clearButton) {
+                    this.frameWindow = frameWindow;
+                    this.parentWindow = parentWindow;
+                    this.parentDocument = parentWindow.document;
+                    this.readButton = readButton;
+                    this.clearButton = clearButton;
+                    this.panel = null;
+                    this.dragHandle = null;
+                    this.resizeObserver = null;
+                    this.dragging = false;
+                    this.pointerId = null;
+                    this.offsetX = 0;
+                    this.offsetY = 0;
+                    this.viewportMargin = 12;
+
+                    this.readLatestResponse = this.readLatestResponse.bind(this);
+                    this.clearAll = this.clearAll.bind(this);
+                    this.startDragging = this.startDragging.bind(this);
+                    this.movePanel = this.movePanel.bind(this);
+                    this.stopDragging = this.stopDragging.bind(this);
+                    this.keepPanelInViewport = this.keepPanelInViewport.bind(this);
+                    this.destroy = this.destroy.bind(this);
+                }
+
+                init() {
+                    if (this.parentDocument.querySelector(".light-chat-theme-override")) {
+                        this.readButton.style.background = "#ffffff";
+                        this.readButton.style.color = "#1f2937";
+                        this.readButton.style.borderColor = "#0284c7";
+                        this.clearButton.style.background = "#ffffff";
+                        this.clearButton.style.color = "#9a3412";
+                        this.clearButton.style.borderColor = "#f97316";
+                    }
+
+                    this.readButton.addEventListener("click", this.readLatestResponse);
+                    this.clearButton.addEventListener("click", this.clearAll);
+                    this.frameWindow.addEventListener("pagehide", this.destroy);
+
+                    this.panel = this.parentDocument.querySelector(".st-key-ai_chat_panel");
+                    this.dragHandle = this.panel
+                        ? this.panel.querySelector(".ai-chat-drag-handle")
+                        : null;
+                    if (!this.panel || !this.dragHandle) {
+                        return;
+                    }
+
+                    this.dragHandle.addEventListener("pointerdown", this.startDragging);
+                    this.dragHandle.addEventListener("pointermove", this.movePanel);
+                    this.dragHandle.addEventListener("pointerup", this.stopDragging);
+                    this.dragHandle.addEventListener("pointercancel", this.stopDragging);
+
+                    if (this.parentWindow.ResizeObserver) {
+                        this.resizeObserver = new this.parentWindow.ResizeObserver(
+                            this.keepPanelInViewport
+                        );
+                        this.resizeObserver.observe(this.panel);
+                    }
+                    this.parentWindow.addEventListener("resize", this.keepPanelInViewport);
+                }
+
+                readLatestResponse() {
+                    const speech = this.parentWindow.speechSynthesis;
+                    if (!speech) {
+                        return;
+                    }
+                    if (speech.speaking || speech.pending) {
+                        speech.cancel();
+                        this.readButton.textContent = "Read latest response";
+                        return;
+                    }
+
+                    const messages = this.panel
+                        ? this.panel.querySelectorAll('[data-testid="stChatMessage"]')
+                        : [];
+                    if (!messages.length) {
+                        return;
+                    }
+
+                    let message = messages[messages.length - 1];
+                    for (let index = messages.length - 1; index >= 0; index -= 1) {
+                        const label = (
+                            messages[index].getAttribute("aria-label") || ""
+                        ).toLowerCase();
+                        if (label.includes("assistant")) {
+                            message = messages[index];
+                            break;
+                        }
+                    }
+
+                    speech.cancel();
+                    const utterance = new this.parentWindow.SpeechSynthesisUtterance(
+                        message.innerText
+                    );
+                    utterance.rate = 1;
+                    this.readButton.textContent = "Stop reading";
+                    const resetButton = () => {
+                        this.readButton.textContent = "Read latest response";
+                    };
+                    utterance.onend = resetButton;
+                    utterance.onerror = resetButton;
+                    speech.speak(utterance);
+                }
+
+                clearAll() {
+                    if (this.parentWindow.speechSynthesis) {
+                        this.parentWindow.speechSynthesis.cancel();
+                    }
+                    const hiddenClearButton = this.parentDocument.querySelector(
+                        ".st-key-ai_chat_clear button"
+                    );
+                    if (hiddenClearButton) {
+                        hiddenClearButton.click();
+                    }
+                }
+
+                startDragging(event) {
+                    event.preventDefault();
+                    const rect = this.panel.getBoundingClientRect();
+                    this.panel.style.setProperty("left", `${rect.left}px`, "important");
+                    this.panel.style.setProperty("top", `${rect.top}px`, "important");
+                    this.panel.style.setProperty("right", "auto", "important");
+                    this.panel.style.setProperty("bottom", "auto", "important");
+                    this.offsetX = event.clientX - rect.left;
+                    this.offsetY = event.clientY - rect.top;
+                    this.dragging = true;
+                    this.pointerId = event.pointerId;
+                    this.dragHandle.setPointerCapture(event.pointerId);
+                    this.parentDocument.body.style.userSelect = "none";
+                }
+
+                movePanel(event) {
+                    if (!this.dragging) {
+                        return;
+                    }
+                    const bounds = this.getPanelBounds();
+                    const left = Math.min(
+                        bounds.maxLeft,
+                        Math.max(bounds.minLeft, event.clientX - this.offsetX)
+                    );
+                    const top = Math.min(
+                        bounds.maxTop,
+                        Math.max(bounds.minTop, event.clientY - this.offsetY)
+                    );
+                    this.panel.style.setProperty("left", `${left}px`, "important");
+                    this.panel.style.setProperty("top", `${top}px`, "important");
+                }
+
+                stopDragging() {
+                    if (
+                        this.dragHandle &&
+                        this.pointerId !== null &&
+                        this.dragHandle.hasPointerCapture(this.pointerId)
+                    ) {
+                        this.dragHandle.releasePointerCapture(this.pointerId);
+                    }
+                    this.dragging = false;
+                    this.pointerId = null;
+                    this.parentDocument.body.style.userSelect = "";
+                }
+
+                getPanelBounds() {
+                    const visibleHandleWidth = Math.min(120, this.panel.offsetWidth);
+                    const handleHeight = this.dragHandle.offsetHeight || 36;
+                    return {
+                        minLeft: this.viewportMargin - this.panel.offsetWidth + visibleHandleWidth,
+                        maxLeft: this.parentWindow.innerWidth - visibleHandleWidth - this.viewportMargin,
+                        minTop: this.viewportMargin,
+                        maxTop: this.parentWindow.innerHeight - handleHeight - this.viewportMargin,
+                    };
+                }
+
+                keepPanelInViewport() {
+                    if (!this.panel || !this.dragHandle) {
+                        return;
+                    }
+                    const rect = this.panel.getBoundingClientRect();
+                    const bounds = this.getPanelBounds();
+                    const left = Math.min(bounds.maxLeft, Math.max(bounds.minLeft, rect.left));
+                    const top = Math.min(bounds.maxTop, Math.max(bounds.minTop, rect.top));
+                    this.panel.style.setProperty("left", `${left}px`, "important");
+                    this.panel.style.setProperty("top", `${top}px`, "important");
+                    this.panel.style.setProperty("right", "auto", "important");
+                    this.panel.style.setProperty("bottom", "auto", "important");
+                }
+
+                destroy() {
+                    this.readButton.removeEventListener("click", this.readLatestResponse);
+                    this.clearButton.removeEventListener("click", this.clearAll);
+                    this.frameWindow.removeEventListener("pagehide", this.destroy);
+                    this.parentWindow.removeEventListener("resize", this.keepPanelInViewport);
+
+                    if (this.dragHandle) {
+                        this.dragHandle.removeEventListener("pointerdown", this.startDragging);
+                        this.dragHandle.removeEventListener("pointermove", this.movePanel);
+                        this.dragHandle.removeEventListener("pointerup", this.stopDragging);
+                        this.dragHandle.removeEventListener("pointercancel", this.stopDragging);
+                    }
+                    if (this.resizeObserver) {
+                        this.resizeObserver.disconnect();
+                        this.resizeObserver = null;
+                    }
+                    if (this.dragging) {
+                        this.parentDocument.body.style.userSelect = "";
+                    }
+                    if (this.parentWindow.speechSynthesis) {
+                        this.parentWindow.speechSynthesis.cancel();
+                    }
+                    if (this.parentWindow.__aiAnalystChatController === this) {
+                        this.parentWindow.__aiAnalystChatController = null;
+                    }
+                }
+            }
+
+            const previousController = window.parent.__aiAnalystChatController;
+            if (previousController && typeof previousController.destroy === "function") {
+                previousController.destroy();
+            }
+
+            const controller = new AIChatController(
+                window,
+                window.parent,
+                document.getElementById("speech-read"),
+                document.getElementById("clear-all")
+            );
+            window.parent.__aiAnalystChatController = controller;
+            controller.init();
+        </script>
+        """,
+        height=28,
+        alt="Read latest response",
+    )
+    st.button(
+        "Clear all",
+        key="ai_chat_clear",
+        on_click=clear_ai_chat_history,
+    )
+
+    chat_query = st.chat_input(
+        "Type your question here...",
+        key="dialog_chat_input",
+    )
+    submitted_query = chat_query
+    if submitted_query:
+        show_sources = st.session_state.rag_engine._sources_requested(submitted_query)
+        previous_user_query = next(
+            (
+                message["content"]
+                for message in reversed(st.session_state.dialog_chat_history)
+                if message.get("role") == "user"
+            ),
+            None,
+        )
+        last_dashboard_topic = st.session_state.get("ai_last_dashboard_topic")
+        previous_assistant = next(
+            (
+                message
+                for message in reversed(st.session_state.dialog_chat_history)
+                if message.get("role") == "assistant" and message.get("sources")
+            ),
+            {},
+        )
+        if not last_dashboard_topic:
+            for source in previous_assistant.get("sources", []):
+                topic_marker = "ai_analyst_knowledge.md - "
+                if topic_marker in source:
+                    last_dashboard_topic = source.split(topic_marker, 1)[1].rstrip("]")
+                    break
+
+        st.session_state.dialog_chat_history.append({"role": "user", "content": submitted_query})
+        with chat_box:
+            with st.chat_message("user", avatar=CHAT_AVATARS["user"]):
+                st.markdown(submitted_query)
+            with st.chat_message("assistant", avatar=CHAT_AVATARS["assistant"]):
+                with st.spinner("Analyzing project results..."):
+                    selection_context = {
+                        "carrier": carrier,
+                        "origin": origin,
+                        "destination": dest,
+                        "flight_date": fl_date.strftime("%Y-%m-%d"),
+                        "scheduled_departure": int(crs_dep_time),
+                        "departure_delay": float(dep_delay),
+                        "distance": float(distance),
+                        "previous_user_query": previous_user_query,
+                        "last_dashboard_topic": last_dashboard_topic,
+                        "previous_sources": previous_assistant.get("sources", []),
+                    }
+                    res = st.session_state.rag_engine.answer_query(
+                        submitted_query,
+                        context=selection_context,
+                        flight_data=analysis_df
+                    )
+                    cleaned_answer = clean_ai_answer(res["answer"])
+                    st.markdown(cleaned_answer)
+                    if show_sources and res.get("sources"):
+                        with st.expander("📚 Sources", expanded=False):
+                            for s in res["sources"]:
+                                st.caption(f"- {s}")
+                    if res.get("topic"):
+                        st.session_state.ai_last_dashboard_topic = res["topic"]
+                    st.session_state.dialog_chat_history.append({
+                        "role": "assistant",
+                        "content": cleaned_answer,
+                        "sources": res.get("sources", []),
+                        "show_sources": show_sources,
+                        "topic": res.get("topic"),
+                    })
+                    assistant_index = len(st.session_state.dialog_chat_history) - 1
+                    st.button(
+                        "Delete Q&A",
+                        key=f"ai_chat_delete_pair_{assistant_index}",
+                        on_click=delete_ai_chat_exchange,
+                        args=(assistant_index,),
+                    )
+
+
+
+
+
 def render_chart(fig):
     fig.update_layout(
-        font=dict(family="Inter, sans-serif", color=chart_text_color),
+        font=dict(family="Segoe UI, sans-serif", color=chart_text_color),
         legend=dict(font=dict(color=chart_text_color)),
         xaxis=dict(
             rangemode="tozero",
@@ -54,7 +540,16 @@ def apply_hour_axis(fig, title):
 # Apply Custom Glassmorphism & Aviation Modern Theme Styling
 st.markdown("""
 <style>
+    :root {
+        --ai-chat-line-height: 1.15;
+        --ai-chat-input-border: #f97316;
+        --ai-chat-input-action: #0284c7;
+    }
+
     /* Dark aviation theme styling */
+    .stApp, .stApp button, .stApp input, .stApp textarea, .stApp select {
+        font-family: "Segoe UI", sans-serif !important;
+    }
     .stApp {
         background-color: #0b0f19;
         color: #e2e8f0;
@@ -231,40 +726,43 @@ def load_cleaning_audit():
 data_audit = load_cleaning_audit()
 
 @st.cache_data
-def load_exploration_summary():
+def load_dashboard_data():
     data_path = os.path.join("data", "processed", "cleaned_flights.csv")
     if not os.path.exists(data_path):
-        return {}
-    columns = ["OP_UNIQUE_CARRIER", "ORIGIN", "CRS_DEP_TIME", "TAXI_OUT"]
-    df = pd.read_csv(data_path, usecols=columns)
-    df["TAXI_OUT"] = pd.to_numeric(df["TAXI_OUT"], errors="coerce")
-    df["CRS_DEP_TIME"] = pd.to_numeric(df["CRS_DEP_TIME"], errors="coerce")
-    df = df.dropna(subset=["TAXI_OUT", "CRS_DEP_TIME"]).copy()
-    df["DEP_HOUR"] = (df["CRS_DEP_TIME"] // 100).clip(0, 23).astype(int)
-    carrier_summary = (df.groupby("OP_UNIQUE_CARRIER", as_index=False)["TAXI_OUT"]
-        .mean().rename(columns={"TAXI_OUT": "Mean Taxi-Out"})
-        .sort_values("Mean Taxi-Out", ascending=True))
-    hour_summary = (df.groupby("DEP_HOUR", as_index=False)["TAXI_OUT"]
-        .mean().rename(columns={"TAXI_OUT": "Mean Taxi-Out"}))
-    origin_summary = (df.groupby("ORIGIN", as_index=False)["TAXI_OUT"]
-        .agg(["mean", "count"]).reset_index()
-        .rename(columns={"mean": "Mean Taxi-Out", "count": "Flights"})
-        .sort_values("Mean Taxi-Out", ascending=False).head(10)
-        .sort_values("Mean Taxi-Out", ascending=True))
-    return {"carrier": carrier_summary, "hour": hour_summary, "origin": origin_summary}
-
-exploration_data = load_exploration_summary()
-@st.cache_data
-def load_analysis_data():
-    data_path = os.path.join("data", "processed", "cleaned_flights.csv")
-    if not os.path.exists(data_path):
-        return pd.DataFrame()
+        return {}, pd.DataFrame()
 
     columns = [
         "FL_DATE", "OP_UNIQUE_CARRIER", "ORIGIN", "DEST",
         "CRS_DEP_TIME", "DEP_DELAY", "TAXI_OUT", "DISTANCE"
     ]
-    df = pd.read_csv(data_path, usecols=columns)
+    raw_df = pd.read_csv(data_path, usecols=columns)
+
+    exploration_df = raw_df[
+        ["OP_UNIQUE_CARRIER", "ORIGIN", "CRS_DEP_TIME", "TAXI_OUT"]
+    ].copy()
+    exploration_df["TAXI_OUT"] = pd.to_numeric(exploration_df["TAXI_OUT"], errors="coerce")
+    exploration_df["CRS_DEP_TIME"] = pd.to_numeric(exploration_df["CRS_DEP_TIME"], errors="coerce")
+    exploration_df = exploration_df.dropna(subset=["TAXI_OUT", "CRS_DEP_TIME"]).copy()
+    exploration_df["DEP_HOUR"] = (
+        (exploration_df["CRS_DEP_TIME"] // 100).clip(0, 23).astype(int)
+    )
+    carrier_summary = (exploration_df.groupby("OP_UNIQUE_CARRIER", as_index=False)["TAXI_OUT"]
+        .mean().rename(columns={"TAXI_OUT": "Mean Taxi-Out"})
+        .sort_values("Mean Taxi-Out", ascending=True))
+    hour_summary = (exploration_df.groupby("DEP_HOUR", as_index=False)["TAXI_OUT"]
+        .mean().rename(columns={"TAXI_OUT": "Mean Taxi-Out"}))
+    origin_summary = (exploration_df.groupby("ORIGIN", as_index=False)["TAXI_OUT"]
+        .agg(["mean", "count"]).reset_index()
+        .rename(columns={"mean": "Mean Taxi-Out", "count": "Flights"})
+        .sort_values("Mean Taxi-Out", ascending=False).head(10)
+        .sort_values("Mean Taxi-Out", ascending=True))
+    exploration_data = {
+        "carrier": carrier_summary,
+        "hour": hour_summary,
+        "origin": origin_summary,
+    }
+
+    df = raw_df
     df["FL_DATE"] = pd.to_datetime(df["FL_DATE"], dayfirst=True, errors="coerce")
     for column in ["CRS_DEP_TIME", "DEP_DELAY", "TAXI_OUT", "DISTANCE"]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -276,9 +774,81 @@ def load_analysis_data():
     df["DAY_NAME"] = df["FL_DATE"].dt.day_name()
     df["ROUTE"] = df["ORIGIN"] + " → " + df["DEST"]
     df["HIGH_RISK"] = df["TAXI_OUT"] >= 30
-    return df
+    return exploration_data, df
 
-analysis_df = load_analysis_data()
+exploration_data, analysis_df = load_dashboard_data()
+
+
+@st.cache_data
+def load_chart_aggregations():
+    _, df = load_dashboard_data()
+    if df.empty:
+        return {}
+
+    origin_stats = (
+        df.groupby("ORIGIN", as_index=False)
+        .agg(
+            Flights=("TAXI_OUT", "size"),
+            Mean_Taxi_Out=("TAXI_OUT", "mean"),
+            Median_Taxi_Out=("TAXI_OUT", "median"),
+            P95_Taxi_Out=("TAXI_OUT", lambda values: values.quantile(0.95)),
+        )
+        .sort_values("Mean_Taxi_Out", ascending=True)
+    )
+
+    day_order = [
+        "Monday", "Tuesday", "Wednesday", "Thursday",
+        "Friday", "Saturday", "Sunday",
+    ]
+    heat_df = (
+        df.pivot_table(
+            index="DAY_NAME",
+            columns="DEP_HOUR",
+            values="TAXI_OUT",
+            aggfunc="mean",
+        )
+        .reindex(day_order)
+    )
+
+    route_stats = (
+        df.groupby(["ORIGIN", "DEST"], as_index=False)
+        .agg(
+            Flights=("TAXI_OUT", "size"),
+            Mean_Taxi_Out=("TAXI_OUT", "mean"),
+            P95_Taxi_Out=("TAXI_OUT", lambda values: values.quantile(0.95)),
+        )
+    )
+    route_stats["ROUTE"] = route_stats["ORIGIN"] + " → " + route_stats["DEST"]
+    busiest_routes = (
+        route_stats.sort_values("Flights", ascending=False)
+        .head(12)
+        .sort_values("Flights")
+    )
+
+    risk_by_hour = (
+        df.groupby("DEP_HOUR", as_index=False)
+        .agg(
+            Flights=("TAXI_OUT", "size"),
+            High_Risk_Rate=("HIGH_RISK", "mean"),
+        )
+    )
+    risk_by_hour["High_Risk_Rate"] *= 100
+
+    return {
+        "monthly": build_monthly_statistics(df),
+        "mean_taxi_out": df["TAXI_OUT"].mean(),
+        "median_taxi_out": df["TAXI_OUT"].median(),
+        "p95_taxi_out": df["TAXI_OUT"].quantile(0.95),
+        "high_risk_pct": df["HIGH_RISK"].mean() * 100,
+        "origin": origin_stats,
+        "heat": heat_df,
+        "routes": busiest_routes,
+        "risk_by_hour": risk_by_hour,
+        "correlation": df["DEP_DELAY"].corr(df["TAXI_OUT"]),
+    }
+
+
+chart_aggregations = load_chart_aggregations()
 
 
 
@@ -297,7 +867,7 @@ def load_model_test_predictions(model_type):
     if "TAXI_OUT" not in test_df.columns or any(column not in test_df.columns for column in feature_columns):
         return pd.DataFrame()
 
-    pipeline, _ = load_deployment_artifacts(model_type=model_type)
+    pipeline, _ = get_cached_model_artifacts(model_type)
     predictions = pipeline.predict(test_df[feature_columns])
     return pd.DataFrame({
         "Actual Taxi-Out": pd.to_numeric(test_df["TAXI_OUT"], errors="coerce"),
@@ -437,7 +1007,7 @@ flight_info = {
 
 # Run Inference
 try:
-    prediction = predict_single_flight(flight_info, model_type=model_type)
+    prediction = get_cached_prediction(flight_info, model_type)
     pred_val = prediction["predicted_taxi_out_minutes"]
     wheels_off = prediction["estimated_wheels_off"]
     sched_dep_str = prediction["scheduled_dep"]
@@ -515,13 +1085,12 @@ with top_kpis:
 st.markdown("<div style=\"height: 0.25rem; clear: both;\"></div>", unsafe_allow_html=True)
 
 # Main Layout Tabs
-tab0, tab5, tab1, tab2, tab3, tab4 = st.tabs([
+tab0, tab5, tab1, tab2, tab3 = st.tabs([
     "📋 Data Understanding",
     "Exploratory Analysis",
     "✈️ Dispatch Simulator",
     "📊 Model Performance & Benchmarks",
     "🚦 Congestion Analytics",
-    "📖 A-CDM Architecture Documentation",
 ])
 
 # ==============================================================================
@@ -614,15 +1183,7 @@ with tab0:
                 st.warning("Monthly analysis is unavailable because the cleaned flight data was not found.")
             else:
                 month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-                monthly_stats = (
-                    analysis_df.groupby(["MONTH_NUM", "MONTH"], as_index=False)
-                    .agg(
-                        Flights=("TAXI_OUT", "size"),
-                        Mean_Taxi_Out=("TAXI_OUT", "mean"),
-                        P95_Taxi_Out=("TAXI_OUT", lambda values: values.quantile(0.95))
-                    )
-                    .sort_values("MONTH_NUM")
-                )
+                monthly_stats = chart_aggregations["monthly"]
                 fig_monthly = px.line(
                     monthly_stats,
                     x="MONTH",
@@ -634,7 +1195,7 @@ with tab0:
                         "MONTH": "Month",
                         "Mean_Taxi_Out": "Mean taxi-out (minutes)"
                     },
-                    hover_data=["Flights", "P95_Taxi_Out"]
+                    hover_data=["Flights", "P25_Taxi_Out", "P50_Taxi_Out", "P75_Taxi_Out", "P90_Taxi_Out", "P95_Taxi_Out", "Max_Taxi_Out", "Min_Taxi_Out"]
                 )
                 fig_monthly.update_traces(line_color="#38bdf8", line_width=3, texttemplate="%{text:.1f}")
                 fig_monthly.update_layout(
@@ -646,7 +1207,7 @@ with tab0:
                     yaxis_title="Mean taxi-out (minutes)"
                 )
                 render_chart(fig_monthly)
-                st.caption("Monthly averages; P95 values are available on hover.")
+                st.caption("Monthly averages; percentile, minimum, and maximum taxi-out values are available on hover.")
     else:
         st.warning("Cleaned flight data was not found, so exploratory charts are unavailable.")
 
@@ -690,7 +1251,7 @@ with tab1:
             template=plotly_template,
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Inter, sans-serif"),
+            font=dict(family="Segoe UI, sans-serif"),
             showlegend=True,
             height=450
         )
@@ -711,20 +1272,8 @@ with tab1:
         st.subheader("📈 Live Congestion Sensitivity Curve")
         st.caption("How surface pushback density at origin affects taxi-out prediction:")
         
-        # Generate dynamic sensitivity curve
-        temp_flight = flight_info.copy()
-        pipeline, encoders = load_deployment_artifacts(model_type=model_type)
-        
-        cong_range = list(range(1, 36))
-        curve_preds = []
-        for c_val in cong_range:
-            temp_flight["CONGESTION_1H"] = c_val
-            temp_flight["CONGESTION_30M"] = c_val // 2
-            X_temp = prepare_flight_features(temp_flight, encoders)
-            curve_preds.append(float(pipeline.predict(X_temp)[0]))
-            
-        curve_df = pd.DataFrame({"Pushbacks / Hour": cong_range, "Predicted Taxi-Out (min)": curve_preds})
-        
+        # Generate the sensitivity curve once per flight scenario and model.
+        curve_df = get_cached_sensitivity_curve(flight_info, model_type)
         fig_curve = px.line(
             curve_df,
             x="Pushbacks / Hour",
@@ -738,7 +1287,7 @@ with tab1:
             template=plotly_template,
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Inter, sans-serif"),
+            font=dict(family="Segoe UI, sans-serif"),
             height=450
         )
         render_chart(fig_curve)
@@ -812,7 +1361,7 @@ with tab2:
         model_metric_defaults = {
             "Linear_Regression_Baseline": {"label": "Linear Regression", "MAE_minutes": 4.17, "RMSE_minutes": 10.04, "R2_Score": 0.0166, "Pct_Within_3_Min": 54.6, "Pct_Within_5_Min": 78.91},
             "Random_Forest_Regressor": {"label": "Random Forest", "MAE_minutes": 4.04, "RMSE_minutes": 10.00, "R2_Score": 0.0239, "Pct_Within_3_Min": 57.48, "Pct_Within_5_Min": 82.60},
-            "XGBoost_Regressor": {"label": "XGBoost", "MAE_minutes": 3.879, "RMSE_minutes": 9.89, "R2_Score": 0.0250, "Pct_Within_3_Min": 60.0, "Pct_Within_5_Min": 84.88}
+            "XGBoost_Regressor": {"label": "XGBoost", "MAE_minutes": 3.879, "RMSE_minutes": 9.89, "R2_Score": 0.0452, "Pct_Within_3_Min": 58.8, "Pct_Within_5_Min": 84.88}
         }
         score_rows = []
         for model_key, defaults in model_metric_defaults.items():
@@ -915,14 +1464,28 @@ with tab2:
             st.caption("Risk bands: Normal <20 min, Moderate 20-30 min, High 30-45 min, Severe 45+ min. This is a classification view of the regression output.")
         st.subheader("Top Feature Importances (Random Forest)")
         
-        feature_imp_df = pd.DataFrame([
-            {"Feature": "CONGESTION_1H", "Importance": 0.285},
-            {"Feature": "DEP_DELAY", "Importance": 0.224},
-            {"Feature": "ORIGIN_TAXI_MEAN", "Importance": 0.182},
-            {"Feature": "SIN_HOUR / COS_HOUR", "Importance": 0.141},
-            {"Feature": "CARRIER_TAXI_MEAN", "Importance": 0.098},
-            {"Feature": "DISTANCE", "Importance": 0.070}
-        ]).sort_values("Importance", ascending=True)
+        rf_importances = (metrics_json or {}).get("feature_importances_rf", [])
+        if not rf_importances:
+            rf_importances = (
+                (metrics_json or {})
+                .get("models", {})
+                .get("Random_Forest_Regressor", {})
+                .get("top_importances", [])
+            )
+        if not rf_importances:
+            rf_importances = [
+                {"feature": "DISTANCE", "importance": 0.3003},
+                {"feature": "DEP_DELAY", "importance": 0.1827},
+                {"feature": "SIN_HOUR", "importance": 0.0881},
+                {"feature": "CONGESTION_1H", "importance": 0.0673},
+                {"feature": "COS_HOUR", "importance": 0.0642},
+                {"feature": "CONGESTION_30M", "importance": 0.0523},
+                {"feature": "ORIGIN_TAXI_MEAN", "importance": 0.0336},
+                {"feature": "CARRIER_TAXI_MEAN", "importance": 0.0238},
+            ]
+        feature_imp_df = pd.DataFrame(rf_importances[:10]).rename(
+            columns={"feature": "Feature", "importance": "Importance"}
+        ).sort_values("Importance", ascending=True)
         
         fig_imp = px.bar(
             feature_imp_df,
@@ -945,18 +1508,33 @@ with tab2:
     st.markdown("### 📊 Model Evaluation & Operational Benchmarks")
     st.markdown("Evaluated on out-of-time test set (November–December 2025 BTS records).")
     
+    benchmark_models = (metrics_json or {}).get("models", {})
+    rf_benchmark = benchmark_models.get("Random_Forest_Regressor", {}).get("test", {})
+    baseline_benchmark = benchmark_models.get("Linear_Regression_Baseline", {}).get("test", {})
+
+    rf_mae = float(rf_benchmark.get("MAE_minutes", 4.04))
+    rf_rmse = float(rf_benchmark.get("RMSE_minutes", 10.00))
+    rf_within_3 = float(rf_benchmark.get("Pct_Within_3_Min", 57.48))
+    rf_within_5 = float(rf_benchmark.get("Pct_Within_5_Min", 82.60))
+    rf_r2 = float(rf_benchmark.get("R2_Score", 0.0239))
+    baseline_mae = float(baseline_benchmark.get("MAE_minutes", 4.17))
+    baseline_rmse = float(baseline_benchmark.get("RMSE_minutes", 10.04))
+    baseline_within_3 = float(baseline_benchmark.get("Pct_Within_3_Min", 54.60))
+    baseline_within_5 = float(baseline_benchmark.get("Pct_Within_5_Min", 78.91))
+    baseline_r2 = float(baseline_benchmark.get("R2_Score", 0.0166))
+
     col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-    
+
     with col_m1:
-        st.metric("Random Forest MAE", "4.04 min", delta="-0.13 min vs Baseline", delta_color="normal")
+        st.metric("Random Forest MAE", f"{rf_mae:.2f} min", delta=f"{rf_mae - baseline_mae:+.2f} min vs Baseline", delta_color="inverse")
     with col_m2:
-        st.metric("Random Forest RMSE", "10.00 min", delta="-0.04 min vs Baseline", delta_color="normal")
+        st.metric("Random Forest RMSE", f"{rf_rmse:.2f} min", delta=f"{rf_rmse - baseline_rmse:+.2f} min vs Baseline", delta_color="inverse")
     with col_m3:
-        st.metric("Within ±3 Min Tolerance", "63.5%", delta="+2.7% vs Baseline", delta_color="normal")
+        st.metric("Within ±3 Min Tolerance", f"{rf_within_3:.1f}%", delta=f"{rf_within_3 - baseline_within_3:+.1f} pp vs Baseline", delta_color="normal")
     with col_m4:
-        st.metric("Within ±5 Min Tolerance", "82.6%", delta="+3.7% vs Baseline", delta_color="normal")
+        st.metric("Within ±5 Min Tolerance", f"{rf_within_5:.1f}%", delta=f"{rf_within_5 - baseline_within_5:+.1f} pp vs Baseline", delta_color="normal")
     with col_m5:
-        st.metric("Model $R^2$ Score", "0.0239", delta="RF Improved", delta_color="normal")
+        st.metric("Model $R^2$ Score", f"{rf_r2:.4f}", delta=f"{rf_r2 - baseline_r2:+.4f} vs Baseline", delta_color="normal")
 
     st.markdown("---")
     
@@ -1054,13 +1632,13 @@ with tab5:
         st.warning("The cleaned flight data was not found, so exploratory analysis is unavailable.")
     else:
         df_exp = analysis_df
-        p50 = df_exp["TAXI_OUT"].median()
-        p95 = df_exp["TAXI_OUT"].quantile(0.95)
-        high_risk_pct = df_exp["HIGH_RISK"].mean() * 100
+        p50 = chart_aggregations["median_taxi_out"]
+        p95 = chart_aggregations["p95_taxi_out"]
+        high_risk_pct = chart_aggregations["high_risk_pct"]
 
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         kpi1.metric("Flights analysed", f"{len(df_exp):,}")
-        kpi2.metric("Mean taxi-out", f"{df_exp['TAXI_OUT'].mean():.1f} min")
+        kpi2.metric("Mean taxi-out", f"{chart_aggregations['mean_taxi_out']:.1f} min")
         kpi3.metric("Median taxi-out", f"{p50:.1f} min")
         kpi4.metric("95th percentile", f"{p95:.1f} min")
         kpi5.metric("Above 30 minutes", f"{high_risk_pct:.1f}%")
@@ -1090,16 +1668,7 @@ with tab5:
 
         with dist_right:
             st.subheader("Origin Airport Comparison")
-            origin_stats = (
-                df_exp.groupby("ORIGIN", as_index=False)
-                .agg(
-                    Flights=("TAXI_OUT", "size"),
-                    Mean_Taxi_Out=("TAXI_OUT", "mean"),
-                    Median_Taxi_Out=("TAXI_OUT", "median"),
-                    P95_Taxi_Out=("TAXI_OUT", lambda values: values.quantile(0.95))
-                )
-                .sort_values("Mean_Taxi_Out", ascending=True)
-            )
+            origin_stats = chart_aggregations["origin"]
             fig_origin_compare = px.bar(
                 origin_stats,
                 x="Mean_Taxi_Out",
@@ -1131,16 +1700,7 @@ with tab5:
 
         with heat_left:
             st.subheader("Congestion Heatmap by Day and Departure Hour")
-            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            heat_df = (
-                df_exp.pivot_table(
-                    index="DAY_NAME",
-                    columns="DEP_HOUR",
-                    values="TAXI_OUT",
-                    aggfunc="mean"
-                )
-                .reindex(day_order)
-            )
+            heat_df = chart_aggregations["heat"]
             fig_heat = go.Figure(data=go.Heatmap(
                 z=heat_df.values,
                 x=heat_df.columns,
@@ -1161,16 +1721,7 @@ with tab5:
 
         with heat_right:
             st.subheader("Busiest Routes")
-            route_stats = (
-                df_exp.groupby(["ORIGIN", "DEST"], as_index=False)
-                .agg(
-                    Flights=("TAXI_OUT", "size"),
-                    Mean_Taxi_Out=("TAXI_OUT", "mean"),
-                    P95_Taxi_Out=("TAXI_OUT", lambda values: values.quantile(0.95))
-                )
-            )
-            route_stats["ROUTE"] = route_stats["ORIGIN"] + " → " + route_stats["DEST"]
-            busiest_routes = route_stats.sort_values("Flights", ascending=False).head(12).sort_values("Flights")
+            busiest_routes = chart_aggregations["routes"]
             fig_routes = px.bar(
                 busiest_routes,
                 x="Flights",
@@ -1201,14 +1752,7 @@ with tab5:
 
         with risk_left:
             st.subheader("High-Risk Departures by Hour")
-            risk_by_hour = (
-                df_exp.groupby("DEP_HOUR", as_index=False)
-                .agg(
-                    Flights=("TAXI_OUT", "size"),
-                    High_Risk_Rate=("HIGH_RISK", "mean")
-                )
-            )
-            risk_by_hour["High_Risk_Rate"] *= 100
+            risk_by_hour = chart_aggregations["risk_by_hour"]
             fig_risk = px.bar(
                 risk_by_hour,
                 x="DEP_HOUR",
@@ -1282,7 +1826,7 @@ with tab5:
                 range=[0, delay_y_max]
             )
             render_chart(fig_delay)
-            correlation = df_exp["DEP_DELAY"].corr(df_exp["TAXI_OUT"])
+            correlation = chart_aggregations["correlation"]
             st.caption(f"Linear correlation in this dataset: {correlation:.3f}. This suggests departure delay and taxi-out should be analysed as separate operational signals.")
 
         st.markdown("---")
@@ -1353,84 +1897,297 @@ with tab5:
             )
             render_chart(fig_delay_band)
         st.info("The dataset is concentrated around DFW and American Airlines, so airport and carrier comparisons should be presented with flight volume and interpreted within this sample.")
-# TAB 4: A-CDM ARCHITECTURE DOCUMENTATION
-# ==============================================================================
-with tab4:
-    doc_title_col, doc_search_col = st.columns([2.2, 1])
-    with doc_title_col:
-        st.markdown("### Airport Collaborative Decision Making (A-CDM) Documentation")
-    with doc_search_col:
-        help_query = st.text_input("Search documentation", placeholder="Search a term...", label_visibility="visible")
+# Floating AI Analyst button and chat panel
+st.markdown("""
+<style>
+.st-key-ai_analyst_toggle {
+    position: fixed !important;
+    right: 28px !important;
+    bottom: 28px !important;
+    width: 180px !important;
+    z-index: 999999 !important;
+}
+.st-key-ai_analyst_toggle button {
+    width: 180px !important;
+    background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
+    color: #ffffff !important;
+    border: 2px solid #38bdf8 !important;
+    border-radius: 50px !important;
+    padding: 14px 18px !important;
+    font-family: "Segoe UI", sans-serif !important;
+    font-size: 18px !important;
+    font-weight: 700 !important;
+    box-shadow: 0 8px 24px rgba(2, 132, 199, 0.65) !important;
+}
+.st-key-ai_chat_clear {
+    display: none !important;
+}
+[class*="st-key-ai_chat_delete_pair_"] {
+    display: flex !important;
+    justify-content: flex-end !important;
+}
+[class*="st-key-ai_chat_delete_pair_"] button {
+    min-height: 0 !important;
+    padding: 2px 7px !important;
+    border: 1px solid #f97316 !important;
+    border-radius: 8px !important;
+    background: transparent !important;
+    color: #f97316 !important;
+    font-size: 10px !important;
+    font-weight: 600 !important;
+}
+.ai-chat-drag-handle {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 0 0 8px 0;
+    padding: 6px 8px;
+    color: #e5e7eb;
+    border: 1px solid rgba(56, 189, 248, 0.45);
+    border-radius: 8px;
+    background: rgba(30, 41, 59, 0.75);
+    cursor: move;
+    touch-action: none;
+    user-select: none;
+    font-weight: 700;
+}
+.ai-chat-drag-handle span {
+    color: #94a3b8;
+    font-size: 10px;
+    font-weight: 400;
+}
+.st-key-ai_chat_panel {
+    position: fixed !important;
+    right: 28px !important;
+    bottom: 92px !important;
+    width: 300px;
+    height: min(590px, calc(100vh - 130px));
+    min-width: 240px !important;
+    min-height: 220px !important;
+    max-width: calc(100vw - 24px) !important;
+    max-height: calc(100vh - 24px) !important;
+    overflow: hidden !important;
+    resize: both !important;
+    display: flex !important;
+    flex-direction: column !important;
+    box-sizing: border-box !important;
+    z-index: 999998 !important;
+    padding: 9px !important;
+    background: #111827 !important;
+    border: 1px solid #38bdf8 !important;
+    border-radius: 16px !important;
+    box-shadow: 0 18px 45px rgba(2, 8, 23, 0.55) !important;
+    font-size: 12px !important;
+    line-height: var(--ai-chat-line-height) !important;
+    font-weight: 400 !important;
+}
+.st-key-ai_chat_panel > div:first-child {
+    flex: 1 1 auto !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
+}
+.st-key-ai_chat_panel > div:first-child > [data-testid="stVerticalBlock"] {
+    height: 100% !important;
+    min-height: 0 !important;
+}
+.st-key-ai_chat_messages {
+    flex: 1 1 0 !important;
+    min-height: 6rem !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+}
+.st-key-ai_chat_messages > [data-testid="stVerticalBlockBorderWrapper"],
+.st-key-ai_chat_messages > [data-testid="stVerticalBlockBorderWrapper"] > div {
+    height: 100% !important;
+    min-height: 0 !important;
+}
+@media (max-width: 480px), (max-height: 520px) {
+    .st-key-ai_chat_panel {
+        min-width: 200px !important;
+        min-height: 180px !important;
+    }
+}
+.st-key-ai_chat_panel *,
+.st-key-ai_chat_panel strong,
+.st-key-ai_chat_panel b {
+    font-size: inherit !important;
+    line-height: var(--ai-chat-line-height) !important;
+    font-weight: 400 !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatMessage"] {
+    padding: 0.25rem 0.15rem !important;
+}
+.st-key-ai_chat_panel [data-testid^="stChatMessageAvatar"] {
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+}
+.st-key-ai_chat_panel [data-testid^="stChatMessageAvatar"] img {
+    width: 100% !important;
+    height: 100% !important;
+    box-sizing: border-box !important;
+    border-radius: 50% !important;
+    object-fit: cover !important;
+    box-shadow: 0 2px 7px rgba(15, 23, 42, 0.32) !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatMessage"] > img {
+    width: 2rem !important;
+    height: 2rem !important;
+    flex: 0 0 2rem !important;
+    box-sizing: border-box !important;
+    border-radius: 50% !important;
+    object-fit: cover !important;
+    box-shadow: 0 2px 7px rgba(15, 23, 42, 0.32) !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatMessage"]:has([aria-label="Chat message from user"]) > img {
+    border: 2px solid #f97316 !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatMessage"]:has([aria-label="Chat message from assistant"]) > img {
+    border: 2px solid #38bdf8 !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatMessageAvatarUser"] img {
+    border: 2px solid #f97316 !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatMessageAvatarAssistant"] img {
+    border: 2px solid #38bdf8 !important;
+}
+.st-key-ai_chat_panel [data-testid="stMarkdownContainer"] p,
+.st-key-ai_chat_panel [data-testid="stMarkdownContainer"] li {
+    margin: 0 0 0.15rem 0 !important;
+    line-height: var(--ai-chat-line-height) !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatInput"] {
+    position: relative !important;
+    padding: 0 !important;
+    border: 4px solid var(--ai-chat-input-border) !important;
+    border-radius: 10px !important;
+    background: #0f172a !important;
+    overflow: hidden !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatInput"] > div,
+.st-key-ai_chat_panel [data-testid="stChatInput"] > div > div,
+.st-key-ai_chat_panel [data-testid="stChatInput"] [data-baseweb="textarea"] {
+    margin: 0 !important;
+    padding: 0 !important;
+    gap: 0 !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    background: transparent !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatInput"] textarea {
+    box-sizing: border-box !important;
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    width: 100% !important;
+    min-height: 3.25rem !important;
+    height: auto;
+    max-height: 10.5rem !important;
+    field-sizing: content;
+    margin: 0 !important;
+    padding: 0.4rem 3.5rem 0.4rem 0.5rem !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    font-size: 12px !important;
+    line-height: var(--ai-chat-line-height) !important;
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+    overflow-y: auto !important;
+    resize: none !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatInput"] button {
+    position: absolute !important;
+    top: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 3rem !important;
+    min-width: 3rem !important;
+    height: auto !important;
+    min-height: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    border: 0 !important;
+    border-left: 3px solid var(--ai-chat-input-border) !important;
+    border-radius: 0 !important;
+    background: var(--ai-chat-input-action) !important;
+    color: #ffffff !important;
+}
+.st-key-ai_chat_panel [data-testid="stChatInput"] button svg {
+    position: absolute !important;
+    left: 50% !important;
+    bottom: 1rem !important;
+    margin: 0 !important;
+    transform: translateX(-50%) !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
+if light_mode:
     st.markdown("""
-    #### What this dashboard does
-    This dashboard estimates how many minutes an aircraft will spend taxiing from pushback to becoming airborne. Use the search box to find plain-language explanations and examples for the terms used throughout the dashboard.
+    <style class="light-chat-theme-override">
+        .st-key-ai_chat_panel {
+            background: #ffffff !important;
+            color: #1f2937 !important;
+            border-color: #0284c7 !important;
+            box-shadow: 0 18px 45px rgba(15, 23, 42, 0.20) !important;
+            color-scheme: light !important;
+        }
+        .st-key-ai_chat_panel .ai-chat-drag-handle {
+            color: #0f172a !important;
+            background: #e8eef7 !important;
+            border-color: #7dd3fc !important;
+        }
+        .st-key-ai_chat_panel .ai-chat-drag-handle span {
+            color: #526174 !important;
+        }
+        .st-key-ai_chat_panel [data-testid="stChatMessage"],
+        .st-key-ai_chat_panel [data-testid="stVerticalBlockBorderWrapper"] {
+            background: transparent !important;
+        }
+        .st-key-ai_chat_panel [data-testid="stMarkdownContainer"] *,
+        .st-key-ai_chat_panel [data-testid="stChatMessage"] * {
+            color: #1f2937 !important;
+        }
+        .st-key-ai_chat_panel [data-testid="stChatInput"] textarea {
+            background: #ffffff !important;
+            color: #1f2937 !important;
+            caret-color: #0284c7 !important;
+        }
+        .st-key-ai_chat_panel [data-testid="stChatInput"],
+        .st-key-ai_chat_panel [data-testid="stChatInput"] > div,
+        .st-key-ai_chat_panel [data-testid="stChatInput"] > div > div,
+        .st-key-ai_chat_panel [data-testid="stChatInput"] [data-baseweb="textarea"] {
+            background: #ffffff !important;
+        }
+        .st-key-ai_chat_panel [data-testid="stChatInput"] textarea::placeholder {
+            color: #64748b !important;
+            opacity: 1 !important;
+        }
+        .st-key-ai_chat_panel [data-testid="stChatInput"] button {
+            background: var(--ai-chat-input-action) !important;
+            color: #ffffff !important;
+        }
+        .st-key-ai_chat_panel details,
+        .st-key-ai_chat_panel details summary {
+            color: #1f2937 !important;
+            background: #f8fafc !important;
+            border-color: #cbd5e1 !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+if "ai_chat_open" not in st.session_state:
+    st.session_state.ai_chat_open = False
 
-    #### Operational architecture
-    The workflow supports Airport Collaborative Decision Making (A-CDM): airlines, airports, and air traffic control use a shared operational picture to coordinate pushback, surface movement, and departure sequencing.
+def toggle_ai_chat():
+    st.session_state.ai_chat_open = not st.session_state.ai_chat_open
 
-    #### Model workflow
-    1. Clean flight records and remove cancelled, diverted, invalid, or extreme target values.
-    2. Build time, congestion, carrier, and airport features.
-    3. Apply the selected prediction model.
-    4. Present the predicted taxi-out time and operational interpretation.
-    """)
+st.button(
+    "Ask AI Analyst",
+    key="ai_analyst_toggle",
+    on_click=toggle_ai_chat,
+)
 
-    help_terms = [
-        {"category": "Data", "term": "Taxi-Out Time", "definition": "The elapsed ground time between pushback and wheels-off. It is the target the models predict.", "example": "If pushback is 08:35 and wheels-off is 09:01, taxi-out time is about 26 minutes."},
-        {"category": "Data", "term": "Raw Records", "definition": "Flight rows available before the cleaning rules are applied.", "example": "The project starts with 75,000 raw records."},
-        {"category": "Data", "term": "Clean Records", "definition": "Rows remaining after cancelled, diverted, invalid, missing, and extreme records are removed.", "example": "A clean record has a usable taxi-out target and valid operational fields."},
-        {"category": "Data", "term": "Retention Rate", "definition": "The percentage of raw records kept after cleaning.", "example": "A 96.36% retention rate means 96.36 out of every 100 raw records remain."},
-        {"category": "Data", "term": "Cancelled Flight", "definition": "A flight that did not operate and should not contribute to taxi-out learning.", "example": "A cancelled row is removed before model training."},
-        {"category": "Data", "term": "Diverted Flight", "definition": "A flight that did not complete its planned operation normally and may not have a comparable taxi-out process.", "example": "A diverted row is excluded from the standard departure-surface analysis."},
-        {"category": "Data", "term": "Outlier", "definition": "An unusually extreme value that can distort model training.", "example": "A taxi-out value above the project threshold of 120 minutes is treated as an outlier."},
-        {"category": "Data", "term": "P75, P90, P95", "definition": "Percentiles: the value below which 75%, 90%, or 95% of observations fall.", "example": "P90 of 29.5 minutes means nine out of ten inspected flights are at or below 29.5 minutes."},
-        {"category": "Flight", "term": "Carrier", "definition": "The airline operating the flight. The interface shows the airline name while the model uses its code.", "example": "American Airlines is represented internally by AA."},
-        {"category": "Flight", "term": "Departure / Origin", "definition": "The airport where the aircraft begins its taxi-out movement.", "example": "DALLAS/FORT WORTH - DFW is the origin airport code DFW."},
-        {"category": "Flight", "term": "Arrival / Destination", "definition": "The planned airport where the flight will land. It is retained for route context.", "example": "CHICAGO O'HARE - ORD is the destination airport code ORD."},
-        {"category": "Flight", "term": "Scheduled Departure", "definition": "The planned departure time in HHMM format.", "example": "830 means 08:30."},
-        {"category": "Flight", "term": "Actual Pushback", "definition": "The time the aircraft leaves the gate and begins its surface movement.", "example": "835 means the aircraft pushed back at 08:35."},
-        {"category": "Flight", "term": "Departure Delay", "definition": "The delay associated with departure before or around pushback.", "example": "A value of 25 means the flight is 25 minutes delayed."},
-        {"category": "Flight", "term": "Stage Distance", "definition": "The planned flight distance in miles. It provides route-length context.", "example": "802 miles is the distance used by the DFW morning example."},
-        {"category": "Congestion", "term": "Surface Traffic Density", "definition": "How many recent pushbacks are occurring at the departure airport.", "example": "18 pushbacks in the past hour indicates a busier departure surface than 5 pushbacks."},
-        {"category": "Congestion", "term": "Origin Pushbacks Past 1 Hr", "definition": "The number of pushbacks from the origin airport during the previous hour.", "example": "A value of 22 is classified as severe surface queueing."},
-        {"category": "Congestion", "term": "Origin Pushbacks Past 30 Min", "definition": "The shorter-term pushback count used to identify a recent surge in traffic.", "example": "12 pushbacks in 30 minutes suggests a concentrated departure bank."},
-        {"category": "Congestion", "term": "Free Flow", "definition": "Low surface activity with little expected queueing.", "example": "Fewer than 8 pushbacks per hour is classified as Low (Free Flow)."},
-        {"category": "Congestion", "term": "Peak Bank", "definition": "A concentrated period when many flights are scheduled to depart close together.", "example": "A high pushback count during a morning bank can increase taxi-out time."},
-        {"category": "Congestion", "term": "Queue Delay", "definition": "The portion of taxi-out time associated with waiting or sequencing behind other aircraft.", "example": "If predicted taxi-out is 26 minutes and the unimpeded base is 18 minutes, the queue component is about 8 minutes."},
-        {"category": "Congestion", "term": "Airfield Queue", "definition": "Aircraft waiting on taxiways or near runway departure points because of surface demand.", "example": "A growing airfield queue is a reason to delay pushback or meter departures."},
-        {"category": "Model", "term": "Prediction Model Engine", "definition": "The model selected to estimate taxi-out duration.", "example": "Choose XGBoost when you want a boosted-tree alternative to Random Forest."},
-        {"category": "Model", "term": "Random Forest Regressor", "definition": "An ensemble of decision trees that averages many tree predictions to model non-linear relationships.", "example": "It can learn that congestion has a stronger effect during busy departure hours."},
-        {"category": "Model", "term": "XGBoost Regressor", "definition": "A gradient-boosted tree model that adds trees sequentially to correct earlier errors.", "example": "It can capture smaller improvements in prediction after the main congestion pattern is learned."},
-        {"category": "Model", "term": "Linear Regression Baseline", "definition": "A simple reference model that estimates a linear relationship between features and taxi-out time.", "example": "It provides a benchmark to determine whether the ensemble models add value."},
-        {"category": "Model", "term": "Feature", "definition": "An input variable supplied to a model.", "example": "DEP_DELAY and DISTANCE are continuous features."},
-        {"category": "Model", "term": "Feature Importance", "definition": "An estimate of how strongly a feature contributes to a tree model prediction.", "example": "CONGESTION_1H ranks highly when surface demand is a major source of delay."},
-        {"category": "Model", "term": "MAE", "definition": "Mean Absolute Error: the average absolute difference between predicted and actual taxi-out minutes.", "example": "MAE of 4.04 means the average error is about 4 minutes."},
-        {"category": "Model", "term": "RMSE", "definition": "Root Mean Squared Error: an error measure that penalizes larger mistakes more strongly than MAE.", "example": "A model with a lower RMSE has fewer severe misses."},
-        {"category": "Model", "term": "R-squared", "definition": "A score describing how much variation in the target is explained by the model relative to a simple baseline.", "example": "A score closer to 1 indicates stronger explained variation, although operational error metrics should also be considered."},
-        {"category": "Model", "term": "Within +/- 3 or 5 Minutes", "definition": "The percentage of predictions whose absolute error is no more than the stated tolerance.", "example": "82.6% within +/-5 minutes means about 83 out of 100 predictions are within five minutes."},
-        {"category": "Analytics", "term": "Exploratory Analysis", "definition": "Visual investigation used to understand patterns before relying on model output.", "example": "Compare mean taxi-out by carrier, hour, and origin to identify operational patterns."},
-        {"category": "Analytics", "term": "Departure Hour", "definition": "The hour extracted from the scheduled departure time.", "example": "18:45 belongs to departure hour 18."},
-        {"category": "Analytics", "term": "Hub Airport", "definition": "An airport with substantial airline or network activity and many connecting or scheduled flights.", "example": "DFW, ATL, and JFK are treated as major operational hubs in the dashboard."},
-        {"category": "Analytics", "term": "Diurnal", "definition": "A pattern that changes across the hours of a day.", "example": "A diurnal wave profile can show higher taxi-out times during morning and evening banks."},
-        {"category": "Operations", "term": "A-CDM", "definition": "Airport Collaborative Decision Making: shared coordination between airport, airline, and air traffic stakeholders.", "example": "A-CDM can use the prediction to coordinate pushback timing with runway and taxiway demand."},
-        {"category": "Operations", "term": "ATC", "definition": "Air Traffic Control, which manages safe and orderly aircraft movement and departure sequencing.", "example": "ATC may use surface demand information when applying departure metering."},
-        {"category": "Operations", "term": "Departure Metering Program (DMP)", "definition": "A procedure that regulates when aircraft push back or join the departure queue to reduce surface congestion.", "example": "If the queue is severe, DMP logic can delay pushback instead of holding aircraft with engines running."},
-        {"category": "Operations", "term": "TBO", "definition": "Trajectory-Based Operations: managing flights using planned and updated trajectories across the airspace system.", "example": "A taxi-out estimate is one ground segment of a broader trajectory plan."}
-    ]
-
-    query = help_query.strip().lower()
-    matching_terms = [
-        item for item in help_terms
-        if not query or query in " ".join(item.values()).lower()
-    ]
-    st.caption(f"Showing {len(matching_terms)} of {len(help_terms)} documentation terms.")
-    if not matching_terms:
-        st.warning("No matching term found. Try a simpler search such as taxi, delay, model, queue, or A-CDM.")
-    for item in matching_terms:
-        with st.expander(f'{item["term"]}  |  {item["category"]}'):
-            st.markdown(f'**Meaning:** {item["definition"]}')
-            st.markdown(f'**Simple example:** {item["example"]}')
-
-    st.markdown("---")
-    st.caption("JNTU Aviation Data Science & Operations Research Coursework Project | BTS Marketing Carrier On-Time Dataset 2025")
+if st.session_state.ai_chat_open:
+    with st.container(key="ai_chat_panel"):
+        show_ai_analyst_dialog()

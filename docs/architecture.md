@@ -43,6 +43,25 @@ flowchart TD
 
 ---
 
+
+### 1.1 AI Analyst Query Routing
+
+The AI Analyst uses a deterministic calculation layer before workbook lookup and document retrieval. This prevents numeric questions from being answered by an unrelated README, report, or parameter description.
+
+```text
+User question
+    -> spelling and phrase normalization
+    -> live-data calculation router
+       - monthly taxi-out statistics and requested percentiles
+       - airport, carrier, route, and hour taxi-out aggregations
+       - cleaned-record shares for an explicitly named airport or carrier
+       - dashboard-default taxi-out interpretation for unscoped average-time questions
+    -> workbook lookup for curated factual answers
+    -> TF-IDF document retrieval for explanatory questions
+```
+
+The default taxi-out interpretation is applied only when the question asks for a time statistic and does not contain a competing metric such as departure delay, distance, flight duration, or model error. This keeps the dashboard context useful without allowing unrelated questions to be silently reinterpreted.
+
 ## 2. Pipeline Components
 
 ### 2.1 Preprocessing & Quality Assurance (`src/data_preprocessing.py`)

@@ -49,6 +49,12 @@ def load_deployment_artifacts(model_type="rf"):
         raise FileNotFoundError(f"Encoder file not found at: {encoder_file}. Please run 'python src/feature_engineering.py' first.")
         
     pipeline = joblib.load(model_file)
+    # Avoid the sklearn/joblib parallel configuration warning during dashboard inference.
+    # The saved model remains unchanged; only runtime worker count is set to one.
+    if hasattr(pipeline, "named_steps") and "regressor" in pipeline.named_steps:
+        regressor = pipeline.named_steps["regressor"]
+        if hasattr(regressor, "n_jobs"):
+            regressor.set_params(n_jobs=1)
     with open(encoder_file, "r") as f:
         target_encoders = json.load(f)
         

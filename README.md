@@ -1,5 +1,18 @@
 GitHub README
->>>>>>> origin/main
+>>>>>>> origin/mainPS D:\JNTU CourseWork\Taxi-In-Out_Prediction> git add README.md
+>> git commit -m "Resolve README merge conflict"
+>> git push -u origin main
+[main a502079] Resolve README merge conflict
+Enumerating objects: 65, done.
+Counting objects: 100% (65/65), done.
+Delta compression using up to 12 threads
+Compressing objects: 100% (60/60), done.
+Writing objects: 100% (63/63), 15.03 MiB | 675.00 KiB/s, done.
+Total 63 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), done.
+To https://github.com/repath/Predicting-Aircraft-Taxi-Out-Duration-.git
+   32dd674..a502079  main -> main
+branch 'main' set up to track 'origin/main'.
 # Aviation Taxi-Out Time Prediction Pipeline
 **Coursework Project: JNTU Aviation Data Science & Operations Research**  
 **Dataset:** BTS Marketing Carrier On-Time Performance (2025 Full Year)  
@@ -9,6 +22,15 @@ GitHub README
 
 ## Overview
 This repository provides a complete, production-ready machine learning framework for predicting **Taxi-Out Duration** (`TAXI_OUT = WHEELS_OFF - DEP_TIME`) in minutes, following standard Airport Collaborative Decision Making (A-CDM) operating principles.
+
+## Architecture Change Backup
+
+Before proceeding with architecture changes, a complete project backup was created on **2026-10-20**.
+
+- **Backup name:** `before arch change`
+- **Location:** `C:\tmp\before arch change`
+- **Contents:** Complete project directory, including `.git`, `.venv`, data, models, outputs, and current working changes.
+- **Verification:** 32,805 files copied with no copy failures.
 
 ## Project Structure
 - `data/`

@@ -61,8 +61,10 @@ The Streamlit dashboard features 6 dedicated operational tabs:
 - **Surface Response Curve:** Non-linear taxi delay escalation as concurrent departures increase from 5 to 25+ per hour.
 - **Airfield Hub Comparisons:** DFW (large 7-runway layout) vs JFK/LGA (geometry constrained) vs ATL (efficient parallel layout).
 
-### 2.5 Tab 4: A-CDM Architecture Documentation
-- Complete reference on Airport Collaborative Decision Making, departure metering programs (DMP), and environmental sustainability impact.
+### 2.5 Tab 4: AI Analyst & A-CDM Architecture Documentation
+- **Interactive AI Analyst (RAG)**: Conversational assistant answering questions grounded directly on project markdown reports with source citations (zero external API cost).
+- **A-CDM Knowledge Base**: Complete reference on Airport Collaborative Decision Making, departure metering programs (DMP), and environmental sustainability impact.
+- **Searchable Operations Terminology**: Filterable operational definitions and real-world flight examples.
 
 ---
 
